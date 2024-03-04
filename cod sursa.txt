@@ -1,0 +1,335 @@
+#include <TM1637Display.h>
+
+#define CLK 13
+#define DIN 11
+#define SS  10
+#define Y_SEGMENTS   4
+#define X_SEGMENTS   2
+#define NUM_SEGMENTS (X_SEGMENTS * Y_SEGMENTS)
+#define BUZZER_PIN 21 
+#define GAME_OVER_FREQ 400  
+#define GAME_OVER_DURATION 1500  
+
+
+#define SUS 7
+#define DREAPTA 4
+#define JOS 5
+#define STANGA 6
+
+#define SEVEN_SEGMENT_CLK 20
+#define SEVEN_SEGMENT_IN 19
+
+TM1637Display display(SEVEN_SEGMENT_CLK, SEVEN_SEGMENT_IN);
+ 
+//pentru display
+char coloane[Y_SEGMENTS][8 * X_SEGMENTS];
+char matrice_extra[8];
+
+//pentru matricea de pozitii ale pieselor in joc
+bool valori[32][16];  
+
+struct Punct {
+  int x, y;
+
+  Punct& operator=(Punct const& altul) {
+    this->x = altul.x;
+    this->y = altul.y;
+
+    return *this;
+  }
+  Punct operator+(Punct const& punct) {
+    return {this->x + punct.x, this->y + punct.y};
+  }
+};
+
+struct Piesa {
+  Punct centru;
+  Punct offset[4];
+  int rotatie;
+
+  Piesa& operator=(Piesa const& alta) {
+    this->centru = alta.centru;
+    for(int i = 0; i < 4; ++i) {
+      this->offset[i] = alta.offset[i];
+    }
+    this->rotatie = alta.rotatie;
+    return *this;
+  }
+
+  Piesa roteste() {
+    Piesa rez = *this;
+
+    for (int i = 0; i < 4; ++i) {
+      auto sch = rez.offset[i].x;
+      rez.offset[i].x = rez.offset[i].y;
+      rez.offset[i].y = sch;
+
+      if (rotatie % 2) {
+        rez.offset[i].y *= -1;
+      } else {
+        rez.offset[i].x *= -1;
+      }
+
+    }
+    rotatie = (rotatie + 1) % 2;
+    return rez;
+  }
+};
+Piesa piesa;
+Piesa nextPiesa;
+
+int scor = 0;
+
+void shiftAll(byte send_to_address, byte send_this_data) {
+  digitalWrite(SS, LOW);
+  for (int i = 0; i < NUM_SEGMENTS; i++) {
+    shiftOut(DIN, CLK, MSBFIRST, send_to_address);
+    shiftOut(DIN, CLK, MSBFIRST, send_this_data);
+  }
+  digitalWrite(SS, HIGH);
+}
+ 
+void show() {
+  for (char index = 7; index >= 0; --index) {
+    digitalWrite(SS, LOW);
+    shiftOut(DIN, CLK, MSBFIRST, 8 - index);
+    shiftOut(DIN, CLK, MSBFIRST, matrice_extra[index]);
+
+    for (char value = 0; value < Y_SEGMENTS; ++value) {
+      shiftOut(DIN, CLK, MSBFIRST, index + 1);
+      shiftOut(DIN, CLK, LSBFIRST, coloane[value][8 + index]);
+    }
+    for (char value = Y_SEGMENTS - 1; value >= 0; --value) {
+      shiftOut(DIN, CLK, MSBFIRST, 8 - index);
+      shiftOut(DIN, CLK, MSBFIRST, coloane[value][index]);
+    }
+    digitalWrite(SS, HIGH);
+  }
+}
+
+void reset() {
+  for (int i = 0; i < 8; ++i) {
+    matrice_extra[i] = 0x00;
+  }
+  for (int i = 0; i < Y_SEGMENTS; ++i) {
+    for (int j = 0; j < 8 * X_SEGMENTS; ++j) {
+      coloane[i][j] = 0x00;
+    }
+  }
+}
+
+void arataPiesa() {
+  for (int i = 0; i < 4; i++) {
+    Punct pozitie = piesa.centru + piesa.offset[i];
+    coloane[(31 - pozitie.y) / 8][pozitie.x] |= 1 << (pozitie.y % 8);
+  }
+}
+
+void arataNextPiesa() {
+  Punct centruModificat = {3, 3};
+  for (int i = 0; i < 4; i++) {
+    Punct pozitie = centruModificat + nextPiesa.offset[i];
+    matrice_extra[ pozitie.y] |= 1 << (7 - pozitie.x % 8);
+  }
+}
+
+void arataTabla() {
+  reset();
+  arataPiesa();
+  arataNextPiesa();
+  for (int i = 0; i < 32; ++i) {
+    for (int j = 0; j < 16; ++j) {
+      if (valori[i][j]) {
+        coloane[(31 - i) / 8][j] |= 1 << (i % 8);
+      }
+    }
+  }
+}
+
+
+Piesa piesaNoua() {
+  static Piesa i_block {{7, 1}, {{-1, 0}, {0, 0}, {1, 0}, {2, 0}}};
+  static Piesa j_block {{7, 1}, {{-1, 0}, {-1, 1}, {0, 1}, {1, 1}}};
+  static Piesa l_block {{7, 1}, {{0, 1}, {-1, 1}, {1, 0}, {1, 1}}};
+  static Piesa o_block {{7, 1}, {{0, 0}, {1, 0}, {0, 1}, {1, 1}}};
+  static Piesa s_block {{7, 1}, {{0, 0}, {1, 0}, {0, 1}, {-1, 1}}};
+  static Piesa t_block {{7, 1}, {{0, 0}, {-1, 1}, {0, 1}, {1, 1}}};
+  static Piesa z_block {{7, 1}, {{0, 0}, {-1, 0}, {0, 1}, {1, 1}}};
+
+  static Piesa piese[] = {j_block, l_block, o_block, s_block, t_block, z_block, i_block};
+  return piese[random(7)];
+}
+
+int valideazaMiscare(Piesa const& piesa, int miscare) {
+  for (int i = 0; i < 4; ++i) {
+    Punct pozitie = piesa.centru + piesa.offset[i];
+
+    if (miscare == 1 && (pozitie.y == 32 || valori[pozitie.y][pozitie.x])) {
+      return 0;
+    }
+
+    if (miscare != 1 && (pozitie.y == 32 || valori[pozitie.y][pozitie.x])) {
+      return -1;
+    }
+    
+    if (pozitie.x < 0 || pozitie.x > 15 || pozitie.y < 0 || pozitie.y > 31) {
+      return -1;
+    }
+  }
+  return 1;
+}
+
+int detecteazaButon() {
+  Piesa copie;
+  int mutata = false;
+  int miscare = 0;
+  if (digitalRead(SUS)) {
+     tone(21, 900, 80);
+    copie = piesa.roteste();
+    mutata = true;
+  } else {
+    copie = piesa;
+    if (digitalRead(STANGA)) {
+      copie.centru.x --;
+      mutata = true;
+    } 
+    if (digitalRead(DREAPTA)) {
+      copie.centru.x ++;
+      mutata = true;
+    }
+    if (digitalRead(JOS)) {
+      copie.centru.y ++;
+      mutata = true;
+      miscare = 1;
+      scor++;
+    }
+  }
+
+  int miscareValida = valideazaMiscare(copie, miscare);
+  if (mutata && miscareValida > 0) {
+    piesa = copie;
+  }
+
+  return miscareValida;
+}
+
+bool jocIntrerupt = false;
+ 
+void setup() {
+  jocIntrerupt = false; 
+  Serial.begin(115200);
+
+  display.setBrightness(7);
+  randomSeed(analogRead(0));
+
+  pinMode(CLK, OUTPUT);
+  pinMode(DIN, OUTPUT);
+  pinMode(SS, OUTPUT);
+ 
+  shiftAll(0x0f, 0x00);
+  shiftAll(0x0b, 0x07); 
+  shiftAll(0x0c, 0x01); 
+  shiftAll(0x0a, 0x0f); 
+  shiftAll(0x09, 0x00); 
+
+  piesa = piesaNoua();
+  nextPiesa = piesaNoua();
+  for (int j = 0; j < 15; ++j){ 
+    valori[31][j] = 1;
+  }
+}
+
+void verificaRanduri() {
+  for (int i = 31; i >= 0; i --) {
+    int j;
+    for (j = 0; j < 16; j ++) {
+      if (!valori[i][j]) {
+        break;
+      }
+    }
+    if (j >= 16) {
+      scor += 100;
+      tone(21, 1000, 100);
+      for (int k = i; k > 0; k --) {
+        for (j = 0; j < 16; j++) {
+          valori[k][j] = valori[k - 1][j];
+        }
+      }
+      i ++;
+    }
+  }
+}
+
+void afiseazaScor() {
+  static const char digits[] = {
+    SEG_A | SEG_B | SEG_C | SEG_D | SEG_E | SEG_F,
+    SEG_B | SEG_C,
+    SEG_A | SEG_B | SEG_D | SEG_E | SEG_G,
+    SEG_A | SEG_B | SEG_C | SEG_D | SEG_G,
+    SEG_B | SEG_C | SEG_F,
+    SEG_A | SEG_C | SEG_D | SEG_F,
+    SEG_A | SEG_C | SEG_D | SEG_E | SEG_F | SEG_G,
+    SEG_A | SEG_B | SEG_C,
+    SEG_A | SEG_B | SEG_C | SEG_D | SEG_E | SEG_F | SEG_G,
+    SEG_A | SEG_B | SEG_C | SEG_D | SEG_F | SEG_G
+  };
+  char numbers[4] = {digits[0], digits[0], digits[0], digits[0]};
+  int cscor = scor;
+  int i = 3;
+  while (cscor) {
+    numbers[i--]  = digits[cscor % 10];
+    cscor /= 10;
+  }
+  display.setSegments(numbers, 4, 0);
+}
+
+long long int ultimaCadere;
+long long int ultimaMutare;
+
+
+ 
+void loop(){
+  if (jocIntrerupt) {
+    return; 
+  }
+  if (millis() - ultimaMutare >= 100) {
+    int miscareValida = detecteazaButon();
+    if (miscareValida == 0) {
+      for (int i = 0; i < 4; i++) {
+        Punct pozitie = piesa.centru + piesa.offset[i];
+        if (pozitie.y == 2) {
+          Serial.println("Jocul s-a oprit!");
+          tone(BUZZER_PIN, GAME_OVER_FREQ, GAME_OVER_DURATION);
+          delay(GAME_OVER_DURATION + 300); 
+          jocIntrerupt = true;  
+          break; 
+           
+        }
+        valori[pozitie.y][pozitie.x] = 1;
+      }
+      piesa = nextPiesa;
+      nextPiesa = piesaNoua();
+    }
+    ultimaMutare = millis();
+  }
+  if (millis() - ultimaCadere >= 500) {
+    Piesa copie = piesa;
+    copie.centru.y ++;
+    if (valideazaMiscare(copie, 1) == 0) {
+      for (int i = 0; i < 4; i++) {
+        Punct pozitie = piesa.centru + piesa.offset[i];
+        valori[pozitie.y][pozitie.x] = 1;
+      }
+      piesa = nextPiesa;
+      nextPiesa = piesaNoua();
+    } else {
+      piesa = copie;
+    }
+    ultimaCadere = millis();
+  }
+  verificaRanduri();
+  afiseazaScor();
+  arataTabla();
+  show();
+  afiseazaScor();
+}
